@@ -1,6 +1,10 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
+import fs from "fs";
+import path from "path";
+import multer from "multer";
+import { fileURLToPath } from "url";
 import { GoogleGenAI } from "@google/genai";
 
 dotenv.config();
@@ -10,12 +14,59 @@ console.log("Gemini Key 是否读取成功：", !!process.env.GEMINI_API_KEY);
 const app = express();
 const port = process.env.PORT || 3000;
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+const uploadsDir = path.join(__dirname, "uploads");
+const projectsFile = path.join(__dirname, "projects.json");
+
+if (!fs.existsSync(uploadsDir)) {
+  fs.mkdirSync(uploadsDir);
+}
+
+if (!fs.existsSync(projectsFile)) {
+  fs.writeFileSync(projectsFile, "[]", "utf-8");
+}
+
 app.use(cors());
-app.use(express.json({ limit: "5mb" }));
+app.use(express.json({ limit: "10mb" }));
+app.use(express.urlencoded({ extended: true }));
 app.use(express.static("public"));
+app.use("/uploads", express.static("uploads"));
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY?.trim(),
+});
+
+const storage = multer.diskStorage({
+  destination: function (req, file, cb) {
+    cb(null, uploadsDir);
+  },
+  filename: function (req, file, cb) {
+    const originalName = Buffer.from(file.originalname, "latin1").toString("utf8");
+    const safeName = originalName
+      .replace(/\s+/g, "-")
+      .replace(/[^\u4e00-\u9fa5a-zA-Z0-9._-]/g, "");
+
+    const uniqueName = `${Date.now()}-${safeName || "demo.html"}`;
+    cb(null, uniqueName);
+  },
+});
+
+const upload = multer({
+  storage,
+  fileFilter: function (req, file, cb) {
+    const isHtml =
+      file.mimetype === "text/html" ||
+      file.originalname.toLowerCase().endsWith(".html") ||
+      file.originalname.toLowerCase().endsWith(".htm");
+
+    if (isHtml) {
+      cb(null, true);
+    } else {
+      cb(new Error("只支持上传 HTML 文件"));
+    }
+  },
 });
 
 const projectOrganizerAgent = `
@@ -79,6 +130,107 @@ const projectOrganizerAgent = `
 }
 `;
 
+function readProjects() {
+  try {
+    const data = fs.readFileSync(projectsFile, "utf-8");
+    return JSON.parse(data || "[]");
+  } catch (error) {
+    return [];
+  }
+}
+
+function saveProjects(projects) {
+  fs.writeFileSync(projectsFile, JSON.stringify(projects, null, 2), "utf-8");
+}
+
+async function organizeProjectWithAI(fileName, projectContent) {
+  const slicedContent = projectContent.slice(0, 8000);
+
+  const prompt = `
+${projectOrganizerAgent}
+
+以下是用户上传或输入的项目信息：
+
+文件名：
+${fileName || "未提供"}
+
+项目内容：
+${slicedContent || "未提供"}
+
+请严格按照 JSON 格式输出。
+`;
+
+  const response = await ai.models.generateContent({
+    model: "gemini-1.5-flash",
+    contents: prompt,
+  });
+
+  let text = response.text || "";
+
+  text = text
+    .replace(/```json/g, "")
+    .replace(/```/g, "")
+    .trim();
+
+  return JSON.parse(text);
+}
+
+// 获取项目列表
+app.get("/api/projects", (req, res) => {
+  const projects = readProjects();
+  res.json(projects);
+});
+
+// 上传 HTML，并自动 AI 整理
+app.post("/api/upload", upload.single("file"), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({
+        error: "没有收到 HTML 文件",
+      });
+    }
+
+    const filePath = req.file.path;
+    const fileName = req.file.filename;
+    const originalName = req.file.originalname;
+
+    const htmlContent = fs.readFileSync(filePath, "utf-8");
+
+    const aiResult = await organizeProjectWithAI(originalName || fileName, htmlContent);
+
+    const projects = readProjects();
+
+    const newProject = {
+      id: Date.now().toString(),
+      title: aiResult.title || originalName || fileName,
+      category: aiResult.category || "其他",
+      tags: Array.isArray(aiResult.tags) ? aiResult.tags : [],
+      summary: aiResult.summary || "暂无简介",
+      fileName,
+      originalName,
+      url: `/uploads/${fileName}`,
+      createdAt: new Date().toISOString(),
+    };
+
+    projects.unshift(newProject);
+    saveProjects(projects);
+
+    res.json({
+      success: true,
+      project: newProject,
+    });
+  } catch (error) {
+    console.error("上传并整理失败：", error);
+
+    res.status(500).json({
+      error: "上传并整理失败",
+      detail: error?.message || String(error),
+      code: error?.code || error?.status || "UNKNOWN",
+    });
+  }
+});
+
+// 保留底部测试按钮接口
 app.post("/api/organize-project", async (req, res) => {
   try {
     const { fileName, projectContent } = req.body;
@@ -89,40 +241,16 @@ app.post("/api/organize-project", async (req, res) => {
       });
     }
 
-    const prompt = `
-${projectOrganizerAgent}
-
-以下是用户上传或输入的项目信息：
-
-文件名：
-${fileName || "未提供"}
-
-项目内容：
-${projectContent || "未提供"}
-
-请严格按照 JSON 格式输出。
-`;
-
-    const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash",
-      contents: prompt,
-    });
-
-    let text = response.text || "";
-
-    text = text
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
-
-    const result = JSON.parse(text);
+    const result = await organizeProjectWithAI(fileName, projectContent || "");
 
     res.json(result);
   } catch (error) {
     console.error("Gemini API 调用失败：", error);
 
     res.status(500).json({
-      error: "项目整理失败，请检查 Gemini API Key、模型名称或额度。",
+      error: "项目整理失败",
+      detail: error?.message || String(error),
+      code: error?.code || error?.status || "UNKNOWN",
     });
   }
 });

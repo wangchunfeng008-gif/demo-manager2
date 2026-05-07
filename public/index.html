@@ -1059,8 +1059,26 @@
       }, 3200);
     }
 
+    function normalizeProject(project) {
+      const createdDate = project.createdAt ? new Date(project.createdAt) : new Date();
+
+      return {
+        id: project.id || createProjectId(),
+        name: project.name || project.title || getBaseName(project.originalName || project.fileName || "未命名项目"),
+        title: project.title || project.name || getBaseName(project.originalName || project.fileName || "未命名项目"),
+        fileName: project.originalName || project.fileName || "未命名文件",
+        category: project.category || fallbackCategory,
+        tags: Array.isArray(project.tags) && project.tags.length ? project.tags : ["HTML", "AI整理"],
+        summary: project.summary || "暂无简介",
+        uploadTime: project.uploadTime || formatTime(createdDate),
+        fileSize: project.fileSize || "已上传",
+        previewUrl: project.previewUrl || project.url || "",
+        url: project.url || project.previewUrl || ""
+      };
+    }
+
     function syncProjects(nextProjects) {
-      projects.splice(0, projects.length, ...nextProjects);
+      projects.splice(0, projects.length, ...nextProjects.map(normalizeProject));
     }
 
     function getEmptyDescription() {
@@ -1072,7 +1090,7 @@
 
     async function loadProjects() {
       if (!isSharedServerMode) {
-        showNotice("当前通过本地文件打开，只能临时预览；团队共享请使用 http://localhost:4173");
+        showNotice("当前通过本地文件打开，只能临时预览；团队共享请使用线上服务地址或 http://localhost:3000");
         render();
         return;
       }
@@ -1083,29 +1101,40 @@
           throw new Error("项目列表加载失败");
         }
         const data = await response.json();
-        syncProjects(data.projects || []);
+        const list = Array.isArray(data) ? data : (data.projects || []);
+        syncProjects(list);
       } catch (error) {
-        showNotice("请通过团队共享服务地址打开页面，例如 http://localhost:4173");
+        showNotice("项目列表加载失败，请确认服务正在运行");
       }
       render();
     }
 
     async function uploadFilesToServer(files) {
-      const formData = new FormData();
-      files.forEach((file) => {
-        formData.append("files", file);
-      });
+      const uploaded = [];
 
-      const response = await fetch("/api/projects", {
-        method: "POST",
-        body: formData
-      });
+      for (const file of files) {
+        const formData = new FormData();
+        formData.append("file", file);
 
-      if (!response.ok) {
-        throw new Error("上传失败");
+        const response = await fetch("/api/upload", {
+          method: "POST",
+          body: formData
+        });
+
+        const data = await response.json();
+
+        if (!response.ok || !data.success) {
+          throw new Error(data.detail || data.error || "上传失败");
+        }
+
+        if (data.project) {
+          uploaded.push(normalizeProject(data.project));
+        }
       }
 
-      return response.json();
+      return {
+        uploaded
+      };
     }
 
     function createLocalProjects(files) {
@@ -1135,9 +1164,10 @@
       }
       return projects.filter((project) => {
         return (
-          project.name.toLowerCase().includes(keyword) ||
-          project.fileName.toLowerCase().includes(keyword) ||
-          project.category.toLowerCase().includes(keyword)
+          String(project.name || "").toLowerCase().includes(keyword) ||
+          String(project.fileName || "").toLowerCase().includes(keyword) ||
+          String(project.category || "").toLowerCase().includes(keyword) ||
+          String(project.summary || "").toLowerCase().includes(keyword)
         );
       });
     }
@@ -1222,9 +1252,9 @@
             <h3 class="project-title">${escapeHtml(project.name)}</h3>
             <div class="project-category">${escapeHtml(project.category)}</div>
             <div class="detail-grid">
+              <span>简介：${escapeHtml(project.summary || "暂无简介")}</span>
               <span>文件名：${escapeHtml(project.fileName)}</span>
               <span>上传时间：${escapeHtml(project.uploadTime)}</span>
-              <span>文件大小：${escapeHtml(project.fileSize)}</span>
             </div>
           </div>
           <div class="tags">${project.tags.map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join("")}</div>
@@ -1300,15 +1330,17 @@
 
       try {
         if (isSharedServerMode) {
+          showNotice("上传中，AI 正在整理项目，请稍等...");
           const data = await uploadFilesToServer(htmlFiles);
-          syncProjects(data.projects || []);
 
           if (data.uploaded && data.uploaded.length) {
             activeCategory = data.uploaded[data.uploaded.length - 1].category;
-            showNotice("已上传 " + data.uploaded.length + " 个项目，团队成员现在可以查看");
+            showNotice("已上传 " + data.uploaded.length + " 个项目，AI 已完成整理");
           }
 
-          if (zipCount > 0 || data.zipCount > 0) {
+          await loadProjects();
+
+          if (zipCount > 0) {
             showNotice("已上传 HTML 项目；ZIP 文件已识别但暂不自动解压");
           }
         } else {
@@ -1317,7 +1349,7 @@
           showNotice("已临时上传 " + localProjects.length + " 个项目；团队共享请通过 http://localhost:4173 打开");
         }
       } catch (error) {
-        showNotice("上传失败：请先运行 node server.js，并通过 http://localhost:4173 打开页面");
+        showNotice("上传失败：" + (error.message || "请确认线上服务正常运行"));
       }
 
       if (ignoredCount > 0 && !htmlFiles.length) {
@@ -1335,7 +1367,7 @@
       }
       activePreviewProjectId = project.id;
       previewTitle.textContent = project.name;
-      previewFrame.src = project.previewUrl;
+      previewFrame.src = project.previewUrl || project.url || "about:blank";
       previewPanel.classList.add("open");
       previewPanel.setAttribute("aria-hidden", "false");
       scrim.classList.add("show");
@@ -1473,7 +1505,7 @@
     openWindowButton.addEventListener("click", () => {
       const project = projects.find((item) => item.id === activePreviewProjectId);
       if (project) {
-        window.open(project.previewUrl, "_blank", "noopener");
+        window.open(project.previewUrl || project.url, "_blank", "noopener");
       }
     });
 
@@ -1492,66 +1524,6 @@
     });
 
     loadProjects();
-  loadProjects();
-
-async function organizeProject() {
-  const fileName = document.getElementById("fileName").value;
-  const projectContent = document.getElementById("projectContent").value;
-  const resultBox = document.getElementById("result");
-
-  if (!fileName.trim() && !projectContent.trim()) {
-    resultBox.textContent = "请先输入文件名或项目内容。";
-    return;
-  }
-
-  resultBox.textContent = "AI 整理中...";
-
-  try {
-    const response = await fetch("/api/organize-project", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        fileName: fileName,
-        projectContent: projectContent
-      })
-    });
-
-    const data = await response.json();
-
-    resultBox.textContent = JSON.stringify(data, null, 2);
-  } catch (error) {
-    resultBox.textContent = "请求失败，请检查 server.js 是否正常运行。";
-  }
-}
-</script>
-<section style="margin: 40px auto; max-width: 800px; padding: 24px; border: 1px solid #ddd; border-radius: 16px;">
-  <h2>AI 项目整理测试</h2>
-
-  <input
-    id="fileName"
-    placeholder="请输入文件名，比如 car-map-demo.html"
-    style="width: 100%; padding: 12px; margin-bottom: 12px; box-sizing: border-box;"
-  />
-
-  <textarea
-    id="projectContent"
-    placeholder="请输入项目内容，比如：一个基于真实地图的小车路径动效页面，支持起点到终点路径展示，小车沿路线运动，整体是车载 HMI 风格。"
-    style="width: 100%; height: 140px; padding: 12px; box-sizing: border-box;"
-  ></textarea>
-
-  <button
-    onclick="organizeProject()"
-    style="margin-top: 12px; padding: 10px 20px; cursor: pointer;"
-  >
-    AI 整理项目
-  </button>
-
-  <pre
-    id="result"
-    style="margin-top: 20px; padding: 16px; background: #f6f6f6; border-radius: 12px; white-space: pre-wrap;"
-  >结果会显示在这里</pre>
-</section>
+  </script>
 </body>
 </html>
