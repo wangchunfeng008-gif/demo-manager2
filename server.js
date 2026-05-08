@@ -1,41 +1,59 @@
 import express from "express";
 import cors from "cors";
 import dotenv from "dotenv";
-import fs from "fs";
-import path from "path";
 import multer from "multer";
-import { fileURLToPath } from "url";
+import path from "path";
 import { GoogleGenAI } from "@google/genai";
+import { createClient } from "@supabase/supabase-js";
 
 dotenv.config();
 
 console.log("Gemini Key 是否读取成功：", !!process.env.GEMINI_API_KEY);
+console.log("Supabase URL 是否读取成功：", !!process.env.SUPABASE_URL);
+console.log("Supabase Key 是否读取成功：", !!process.env.SUPABASE_SERVICE_ROLE_KEY);
+console.log("Supabase Bucket：", process.env.SUPABASE_BUCKET || "html-demos");
 
 const app = express();
 const port = process.env.PORT || 3000;
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const supabaseBucket = process.env.SUPABASE_BUCKET || "html-demos";
 
-const uploadsDir = path.join(__dirname, "uploads");
-const projectsFile = path.join(__dirname, "projects.json");
-
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+if (!supabaseUrl || !supabaseServiceRoleKey) {
+  console.warn("Supabase 环境变量缺失，请检查 SUPABASE_URL 和 SUPABASE_SERVICE_ROLE_KEY");
 }
 
-if (!fs.existsSync(projectsFile)) {
-  fs.writeFileSync(projectsFile, "[]", "utf-8");
-}
+const supabase = createClient(supabaseUrl, supabaseServiceRoleKey);
+
+const ai = new GoogleGenAI({
+  apiKey: process.env.GEMINI_API_KEY?.trim(),
+});
 
 app.use(cors());
 app.use(express.json({ limit: "10mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(express.static("public"));
-app.use("/uploads", express.static("uploads"));
 
-const ai = new GoogleGenAI({
-  apiKey: process.env.GEMINI_API_KEY?.trim(),
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 20 * 1024 * 1024,
+  },
+  fileFilter: function (req, file, cb) {
+    const lowerName = String(file.originalname || "").toLowerCase();
+
+    const isHtml =
+      file.mimetype === "text/html" ||
+      lowerName.endsWith(".html") ||
+      lowerName.endsWith(".htm");
+
+    if (isHtml) {
+      cb(null, true);
+    } else {
+      cb(new Error("只支持上传 HTML 文件"));
+    }
+  },
 });
 
 const projectOrganizerAgent = `
@@ -111,30 +129,6 @@ const projectOrganizerAgent = `
   "summary": "一句话项目简介"
 }
 `;
-
-function readProjects() {
-  try {
-    const data = fs.readFileSync(projectsFile, "utf-8");
-    const parsed = JSON.parse(data || "[]");
-
-    if (Array.isArray(parsed)) {
-      return parsed;
-    }
-
-    if (Array.isArray(parsed.projects)) {
-      return parsed.projects;
-    }
-
-    return [];
-  } catch (error) {
-    console.error("读取 projects.json 失败：", error);
-    return [];
-  }
-}
-
-function saveProjects(projects) {
-  fs.writeFileSync(projectsFile, JSON.stringify(projects, null, 2), "utf-8");
-}
 
 function formatFileSize(bytes = 0) {
   if (bytes < 1024) {
@@ -231,54 +225,181 @@ ${slicedContent || "未提供"}
 请严格按照 JSON 格式输出。
 `;
 
-  const response = await ai.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: prompt,
-  });
+  const maxRetries = 3;
 
-  const text = response.text || "";
-  return extractJsonFromText(text);
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const response = await ai.models.generateContent({
+        model: "gemini-2.5-flash",
+        contents: prompt,
+      });
+
+      const text = response.text || "";
+      return extractJsonFromText(text);
+    } catch (error) {
+      const message = error?.message || String(error);
+      const status = error?.status || error?.code;
+
+      const isTemporary =
+        status === 503 ||
+        message.includes("high demand") ||
+        message.includes("UNAVAILABLE");
+
+      if (isTemporary && attempt < maxRetries) {
+        console.log(`Gemini 繁忙，正在第 ${attempt + 1} 次重试...`);
+        await new Promise((resolve) => setTimeout(resolve, attempt * 2000));
+        continue;
+      }
+
+      throw error;
+    }
+  }
 }
 
-const storage = multer.diskStorage({
-  destination: function (req, file, cb) {
-    cb(null, uploadsDir);
-  },
-  filename: function (req, file, cb) {
-    const fixed = makeSafeStoredFileName(file.originalname || "demo.html");
+function normalizeProjectFromDb(row) {
+  return {
+    id: row.id,
+    title: row.title,
+    name: row.name || row.title,
+    category: row.category || "其他",
+    summary: row.summary || "暂无简介",
+    tags: Array.isArray(row.tags) ? row.tags : [],
+    fileName: row.file_name,
+    storedFileName: row.stored_file_name,
+    fileUrl: row.file_url,
+    previewUrl: row.preview_url || row.file_url,
+    uploadTime: row.upload_time,
+    fileSize: row.file_size,
+    url: row.file_url,
+    createdAt: row.created_at,
+  };
+}
 
-    file.fixedOriginalName = fixed.displayName;
-    file.storedFileName = fixed.storedName;
+async function getProjectsFromSupabase() {
+  const { data, error } = await supabase
+    .from("projects")
+    .select("*")
+    .order("created_at", { ascending: false });
 
-    cb(null, fixed.storedName);
-  },
-});
+  if (error) {
+    throw error;
+  }
 
-const upload = multer({
-  storage,
-  fileFilter: function (req, file, cb) {
-    const lowerName = String(file.originalname || "").toLowerCase();
+  return (data || []).map(normalizeProjectFromDb);
+}
 
-    const isHtml =
-      file.mimetype === "text/html" ||
-      lowerName.endsWith(".html") ||
-      lowerName.endsWith(".htm");
+async function saveProjectToSupabase(project) {
+  const row = {
+    id: project.id,
+    title: project.title,
+    name: project.name,
+    category: project.category,
+    summary: project.summary,
+    tags: project.tags,
+    file_name: project.fileName,
+    stored_file_name: project.storedFileName,
+    file_url: project.fileUrl,
+    preview_url: project.previewUrl,
+    upload_time: project.uploadTime,
+    file_size: project.fileSize,
+    created_at: project.createdAt,
+  };
 
-    if (isHtml) {
-      cb(null, true);
-    } else {
-      cb(new Error("只支持上传 HTML 文件"));
-    }
-  },
-});
+  const { data, error } = await supabase
+    .from("projects")
+    .insert(row)
+    .select()
+    .single();
+
+  if (error) {
+    throw error;
+  }
+
+  return normalizeProjectFromDb(data);
+}
+
+async function uploadHtmlToSupabaseStorage(file, storedFileName) {
+  const { error } = await supabase.storage
+    .from(supabaseBucket)
+    .upload(storedFileName, file.buffer, {
+      contentType: "text/html; charset=utf-8",
+      upsert: true,
+    });
+
+  if (error) {
+    throw error;
+  }
+
+  const { data } = supabase.storage
+    .from(supabaseBucket)
+    .getPublicUrl(storedFileName);
+
+  return data.publicUrl;
+}
+
+async function deleteHtmlFromSupabaseStorage(storedFileName) {
+  if (!storedFileName) {
+    return;
+  }
+
+  const { error } = await supabase.storage
+    .from(supabaseBucket)
+    .remove([storedFileName]);
+
+  if (error) {
+    console.warn("删除 Supabase Storage 文件失败：", error);
+  }
+}
+
+async function createProjectFromUploadedFile(file) {
+  const fixed = makeSafeStoredFileName(file.originalname || "demo.html");
+  const originalName = fixed.displayName;
+  const storedFileName = fixed.storedName;
+
+  const htmlContent = file.buffer.toString("utf-8");
+
+  const fileUrl = await uploadHtmlToSupabaseStorage(file, storedFileName);
+
+  const aiResult = await organizeProjectWithAI(originalName, htmlContent);
+
+  const now = new Date();
+
+  const project = {
+    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    title: aiResult.title || originalName,
+    summary: aiResult.summary || "暂无简介",
+    name: aiResult.title || originalName,
+    fileName: originalName,
+    storedFileName,
+    fileUrl,
+    previewUrl: fileUrl,
+    category: aiResult.category || "其他",
+    tags: Array.isArray(aiResult.tags) ? aiResult.tags : [],
+    uploadTime: formatTime(now),
+    fileSize: formatFileSize(file.size),
+    createdAt: now.toISOString(),
+  };
+
+  return saveProjectToSupabase(project);
+}
 
 // 获取项目列表
-app.get("/api/projects", (req, res) => {
-  const projects = readProjects();
+app.get("/api/projects", async (req, res) => {
+  try {
+    const projects = await getProjectsFromSupabase();
 
-  res.json({
-    projects,
-  });
+    res.json({
+      projects,
+    });
+  } catch (error) {
+    console.error("获取项目列表失败：", error);
+
+    res.status(500).json({
+      error: "获取项目列表失败",
+      detail: error?.message || String(error),
+      code: error?.code || error?.status || "UNKNOWN",
+    });
+  }
 });
 
 // 上传单个 HTML，并自动 AI 整理
@@ -290,44 +411,8 @@ app.post("/api/upload", upload.single("file"), async (req, res) => {
       });
     }
 
-    const filePath = req.file.path;
-    const storedFileName = req.file.filename;
-    const originalName =
-      req.file.fixedOriginalName ||
-      repairFileName(req.file.originalname || storedFileName);
-
-    const htmlContent = fs.readFileSync(filePath, "utf-8");
-
-    const aiResult = await organizeProjectWithAI(
-      originalName || storedFileName,
-      htmlContent
-    );
-
-    const projects = readProjects();
-
-    const now = new Date();
-
-    const newProject = {
-      id: Date.now().toString(),
-
-      title: aiResult.title || originalName || storedFileName,
-      summary: aiResult.summary || "暂无简介",
-
-      name: aiResult.title || originalName || storedFileName,
-      fileName: originalName || storedFileName,
-      storedFileName,
-      category: aiResult.category || "其他",
-      tags: Array.isArray(aiResult.tags) ? aiResult.tags : [],
-      uploadTime: formatTime(now),
-      fileSize: formatFileSize(req.file.size),
-      previewUrl: `/uploads/${storedFileName}`,
-
-      url: `/uploads/${storedFileName}`,
-      createdAt: now.toISOString(),
-    };
-
-    projects.unshift(newProject);
-    saveProjects(projects);
+    const newProject = await createProjectFromUploadedFile(req.file);
+    const projects = await getProjectsFromSupabase();
 
     res.json({
       success: true,
@@ -357,45 +442,14 @@ app.post("/api/projects", upload.array("files"), async (req, res) => {
       });
     }
 
-    const projects = readProjects();
     const uploaded = [];
 
     for (const file of files) {
-      const filePath = file.path;
-      const storedFileName = file.filename;
-      const originalName =
-        file.fixedOriginalName ||
-        repairFileName(file.originalname || storedFileName);
-      const htmlContent = fs.readFileSync(filePath, "utf-8");
-
-      const aiResult = await organizeProjectWithAI(
-        originalName || storedFileName,
-        htmlContent
-      );
-
-      const now = new Date();
-
-      const newProject = {
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-        title: aiResult.title || originalName || storedFileName,
-        summary: aiResult.summary || "暂无简介",
-        name: aiResult.title || originalName || storedFileName,
-        fileName: originalName || storedFileName,
-        storedFileName,
-        category: aiResult.category || "其他",
-        tags: Array.isArray(aiResult.tags) ? aiResult.tags : [],
-        uploadTime: formatTime(now),
-        fileSize: formatFileSize(file.size),
-        previewUrl: `/uploads/${storedFileName}`,
-        url: `/uploads/${storedFileName}`,
-        createdAt: now.toISOString(),
-      };
-
-      projects.unshift(newProject);
+      const newProject = await createProjectFromUploadedFile(file);
       uploaded.push(newProject);
     }
 
-    saveProjects(projects);
+    const projects = await getProjectsFromSupabase();
 
     res.json({
       success: true,
@@ -415,36 +469,38 @@ app.post("/api/projects", upload.array("files"), async (req, res) => {
 });
 
 // 删除项目
-app.delete("/api/projects/:id", (req, res) => {
+app.delete("/api/projects/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const projects = readProjects();
 
-    const targetProject = projects.find((project) => project.id === id);
+    const { data: targetProject, error: selectError } = await supabase
+      .from("projects")
+      .select("*")
+      .eq("id", id)
+      .single();
 
-    if (!targetProject) {
+    if (selectError || !targetProject) {
       return res.status(404).json({
         error: "未找到该项目",
       });
     }
 
-    const nextProjects = projects.filter((project) => project.id !== id);
+    await deleteHtmlFromSupabaseStorage(targetProject.stored_file_name);
 
-    const fileNameToDelete = targetProject.storedFileName || targetProject.fileName;
+    const { error: deleteError } = await supabase
+      .from("projects")
+      .delete()
+      .eq("id", id);
 
-    if (fileNameToDelete) {
-      const targetFilePath = path.join(uploadsDir, fileNameToDelete);
-
-      if (fs.existsSync(targetFilePath)) {
-        fs.unlinkSync(targetFilePath);
-      }
+    if (deleteError) {
+      throw deleteError;
     }
 
-    saveProjects(nextProjects);
+    const projects = await getProjectsFromSupabase();
 
     res.json({
       success: true,
-      projects: nextProjects,
+      projects,
     });
   } catch (error) {
     console.error("删除项目失败：", error);
