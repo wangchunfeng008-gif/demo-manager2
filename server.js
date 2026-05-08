@@ -180,7 +180,6 @@ function makeSafeStoredFileName(originalName = "demo.html") {
   const ext = path.extname(repairedName).toLowerCase() || ".html";
   const baseName = path.basename(repairedName, ext);
 
-  // Supabase Storage 的 object key 尽量只用英文、数字、横杠、下划线，避免中文/特殊字符导致 Invalid key
   const safeBaseName = baseName
     .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
@@ -193,10 +192,7 @@ function makeSafeStoredFileName(originalName = "demo.html") {
   const randomSuffix = Math.random().toString(36).slice(2, 8);
 
   return {
-    // 页面展示用，保留中文文件名
     displayName: repairedName,
-
-    // Supabase Storage 存储用，只使用安全文件名
     storedName: `${Date.now()}-${safeBaseName || "demo"}-${randomSuffix}${ext}`,
   };
 }
@@ -266,7 +262,17 @@ ${slicedContent || "未提供"}
   }
 }
 
+function getPreviewPath(storedFileName, fallbackUrl) {
+  if (!storedFileName) {
+    return fallbackUrl || "";
+  }
+
+  return `/api/preview/${encodeURIComponent(storedFileName)}`;
+}
+
 function normalizeProjectFromDb(row) {
+  const previewPath = getPreviewPath(row.stored_file_name, row.file_url);
+
   return {
     id: row.id,
     title: row.title,
@@ -277,10 +283,10 @@ function normalizeProjectFromDb(row) {
     fileName: row.file_name,
     storedFileName: row.stored_file_name,
     fileUrl: row.file_url,
-    previewUrl: row.preview_url || row.file_url,
+    previewUrl: previewPath,
     uploadTime: row.upload_time,
     fileSize: row.file_size,
-    url: row.file_url,
+    url: previewPath,
     createdAt: row.created_at,
   };
 }
@@ -368,14 +374,13 @@ async function createProjectFromUploadedFile(file) {
 
   const htmlContent = file.buffer.toString("utf-8");
 
-  // 先上传到 Supabase Storage
   const fileUrl = await uploadHtmlToSupabaseStorage(file, storedFileName);
 
   try {
-    // 再调用 AI 整理
     const aiResult = await organizeProjectWithAI(originalName, htmlContent);
 
     const now = new Date();
+    const previewPath = getPreviewPath(storedFileName, fileUrl);
 
     const project = {
       id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
@@ -385,7 +390,7 @@ async function createProjectFromUploadedFile(file) {
       fileName: originalName,
       storedFileName,
       fileUrl,
-      previewUrl: fileUrl,
+      previewUrl: previewPath,
       category: aiResult.category || "其他",
       tags: Array.isArray(aiResult.tags) ? aiResult.tags : [],
       uploadTime: formatTime(now),
@@ -395,11 +400,49 @@ async function createProjectFromUploadedFile(file) {
 
     return saveProjectToSupabase(project);
   } catch (error) {
-    // 如果 AI 或数据库写入失败，顺手把刚上传的 HTML 删掉，避免 Storage 残留垃圾文件
     await deleteHtmlFromSupabaseStorage(storedFileName);
     throw error;
   }
 }
+
+// 通过后端代理预览 HTML，强制以 text/html 渲染，避免 Supabase Storage 直接显示源码
+app.get("/api/preview/:storedFileName", async (req, res) => {
+  try {
+    const storedFileName = decodeURIComponent(req.params.storedFileName);
+
+    const { data, error } = await supabase.storage
+      .from(supabaseBucket)
+      .download(storedFileName);
+
+    if (error) {
+      throw error;
+    }
+
+    const arrayBuffer = await data.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Content-Disposition", "inline");
+    res.setHeader("Cache-Control", "no-store");
+    res.send(buffer);
+  } catch (error) {
+    console.error("预览 HTML 失败：", error);
+
+    res.status(500).send(`
+      <!DOCTYPE html>
+      <html lang="zh-CN">
+        <head>
+          <meta charset="UTF-8" />
+          <title>预览失败</title>
+        </head>
+        <body style="font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', sans-serif; padding: 24px;">
+          <h2>预览失败</h2>
+          <p>${error?.message || "无法读取 HTML 文件"}</p>
+        </body>
+      </html>
+    `);
+  }
+});
 
 // 获取项目列表
 app.get("/api/projects", async (req, res) => {
