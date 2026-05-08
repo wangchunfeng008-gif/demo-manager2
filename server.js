@@ -177,17 +177,27 @@ function repairFileName(fileName = "demo.html") {
 
 function makeSafeStoredFileName(originalName = "demo.html") {
   const repairedName = repairFileName(originalName);
-  const ext = path.extname(repairedName) || ".html";
+  const ext = path.extname(repairedName).toLowerCase() || ".html";
   const baseName = path.basename(repairedName, ext);
 
+  // Supabase Storage 的 object key 尽量只用英文、数字、横杠、下划线，避免中文/特殊字符导致 Invalid key
   const safeBaseName = baseName
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
     .replace(/\s+/g, "-")
-    .replace(/[^\u4e00-\u9fa5a-zA-Z0-9._-]/g, "")
+    .replace(/[^a-zA-Z0-9._-]/g, "")
+    .replace(/-+/g, "-")
+    .replace(/^[-_.]+|[-_.]+$/g, "")
     .slice(0, 80);
 
+  const randomSuffix = Math.random().toString(36).slice(2, 8);
+
   return {
+    // 页面展示用，保留中文文件名
     displayName: repairedName,
-    storedName: `${Date.now()}-${safeBaseName || "demo"}${ext}`,
+
+    // Supabase Storage 存储用，只使用安全文件名
+    storedName: `${Date.now()}-${safeBaseName || "demo"}-${randomSuffix}${ext}`,
   };
 }
 
@@ -358,29 +368,37 @@ async function createProjectFromUploadedFile(file) {
 
   const htmlContent = file.buffer.toString("utf-8");
 
+  // 先上传到 Supabase Storage
   const fileUrl = await uploadHtmlToSupabaseStorage(file, storedFileName);
 
-  const aiResult = await organizeProjectWithAI(originalName, htmlContent);
+  try {
+    // 再调用 AI 整理
+    const aiResult = await organizeProjectWithAI(originalName, htmlContent);
 
-  const now = new Date();
+    const now = new Date();
 
-  const project = {
-    id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    title: aiResult.title || originalName,
-    summary: aiResult.summary || "暂无简介",
-    name: aiResult.title || originalName,
-    fileName: originalName,
-    storedFileName,
-    fileUrl,
-    previewUrl: fileUrl,
-    category: aiResult.category || "其他",
-    tags: Array.isArray(aiResult.tags) ? aiResult.tags : [],
-    uploadTime: formatTime(now),
-    fileSize: formatFileSize(file.size),
-    createdAt: now.toISOString(),
-  };
+    const project = {
+      id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      title: aiResult.title || originalName,
+      summary: aiResult.summary || "暂无简介",
+      name: aiResult.title || originalName,
+      fileName: originalName,
+      storedFileName,
+      fileUrl,
+      previewUrl: fileUrl,
+      category: aiResult.category || "其他",
+      tags: Array.isArray(aiResult.tags) ? aiResult.tags : [],
+      uploadTime: formatTime(now),
+      fileSize: formatFileSize(file.size),
+      createdAt: now.toISOString(),
+    };
 
-  return saveProjectToSupabase(project);
+    return saveProjectToSupabase(project);
+  } catch (error) {
+    // 如果 AI 或数据库写入失败，顺手把刚上传的 HTML 删掉，避免 Storage 残留垃圾文件
+    await deleteHtmlFromSupabaseStorage(storedFileName);
+    throw error;
+  }
 }
 
 // 获取项目列表
